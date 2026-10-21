@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: 2026 Xinba210 contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""File integrity, archive and review helpers for offline Pixal3D inspection."""
+
+import hashlib
+import html
+import os
+import shutil
+import stat
+from pathlib import Path
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def archive_master(source, archive_dir, fingerprint):
+    """Copy an immutable-by-convention master without ever changing the input."""
+    source = Path(source).resolve(strict=True)
+    archive_dir = Path(archive_dir).resolve()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / f"{source.stem}_{fingerprint[:16]}{source.suffix.lower()}"
+    if target == source:
+        raise ValueError("Archive target must differ from the source")
+    if target.exists():
+        if sha256_file(target) != fingerprint:
+            raise ValueError("Existing master archive has a different hash")
+        return target
+    partial = target.with_suffix(target.suffix + ".partial")
+    try:
+        with source.open("rb") as source_file, partial.open("xb") as target_file:
+            shutil.copyfileobj(source_file, target_file, length=4 * 1024 * 1024)
+            target_file.flush()
+            os.fsync(target_file.fileno())
+        if sha256_file(partial) != fingerprint:
+            raise ValueError("Master archive integrity mismatch")
+        partial.replace(target)
+        target.chmod(stat.S_IREAD)
+    finally:
+        if partial.exists():
+            partial.unlink()
+    return target
+
+
+def view_axes(front_axis):
+    """Anatomical camera directions for an explicitly declared asset-forward axis."""
+    lookup = {"+X": (1, 0, 0), "-X": (-1, 0, 0), "+Y": (0, 1, 0), "-Y": (0, -1, 0)}
+    front = lookup[front_axis]
+    right = (front[1], -front[0], 0)
+    return {
+        "front": front,
+        "back": tuple(-part for part in front),
+        "left": tuple(-part for part in right),
+        "right": right,
+        "top": (0, 0, 1),
+    }
+
+
+def quality_warnings(metrics):
+    warnings = []
+    if metrics["meshes"] == 0 or metrics["polygons"] == 0:
+        warnings.append("No renderable polygon geometry")
+    if metrics["loose_vertices"]:
+        warnings.append(f"{metrics['loose_vertices']} loose vertices")
+    if metrics["degenerate_faces"]:
+        warnings.append(f"{metrics['degenerate_faces']} near-zero-area faces")
+    if metrics["non_manifold_edges"]:
+        warnings.append(f"{metrics['non_manifold_edges']} non-manifold edges")
+    if metrics["boundary_edges"]:
+        warnings.append(f"{metrics['boundary_edges']} open boundary edges")
+    if metrics["negative_scale_objects"]:
+        warnings.append(f"{metrics['negative_scale_objects']} objects with negative scale")
+    if metrics["uv_layers"] == 0:
+        warnings.append("No UV layers detected")
+    return warnings
+
+
+def build_html(report):
+    """Standalone gallery using only files in the local QA output directory."""
+    metrics = report["geometry"]
+    warnings = report["warnings"]
+    rows = "".join(
+        f"<tr><td>{html.escape(str(key))}</td><td>{html.escape(str(value))}</td></tr>"
+        for key, value in metrics.items()
+    )
+    cards = "".join(
+        '<figure><img loading="lazy" alt="'
+        + html.escape(view)
+        + '" src="views/'
+        + view
+        + '.png"><figcaption>'
+        + html.escape(view.title())
+        + "</figcaption></figure>"
+        for view in ("front", "back", "left", "right", "top")
+    )
+    notices = "".join(f"<li>{html.escape(warning)}</li>" for warning in warnings)
+    status = "REVIEW REQUIRED" if warnings else "GEOMETRY CHECK OK"
+    return (
+        '<!doctype html><html lang="en"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        "<title>Pixal3D offline QA</title><style>"
+        "body{margin:2rem auto;max-width:1200px;padding:0 1rem;font:16px system-ui;"
+        "background:#101720;color:#e9eff8}h1{font-size:1.8rem}small{color:#a1b1c4}"
+        "figure{margin:0;background:#243242;border-radius:12px;overflow:hidden}"
+        "img{display:block;width:100%;aspect-ratio:1;object-fit:contain}"
+        "figcaption{padding:.7rem 1rem}.gallery{display:grid;"
+        "grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:1rem}"
+        "table{border-collapse:collapse;width:100%;max-width:700px}"
+        "td{border-bottom:1px solid #324356;padding:.45rem}"
+        "td:last-child{text-align:right}a{color:#8ec5ff}</style>"
+        f"<h1>{html.escape(report['source_name'])} · Offline 3D QA</h1>"
+        f"<p><strong>{status}</strong> · Five orthographic geometry views</p>"
+        "<small>Lighting is Blender Workbench, not a PBR/material-fidelity proof. "
+        "T/A poses require rigging and are not generated by this geometry check.</small>"
+        '<h2>Views</h2><section class="gallery">' + cards + "</section>"
+        "<h2>Topology flags</h2><ul>" + (notices or "<li>None detected</li>") + "</ul>"
+        "<h2>Geometry metrics</h2><table>" + rows + "</table>"
+        f"<p><small>Master SHA256: {html.escape(report['source_sha256'])}</small></p>"
+        "<p><small>This report is local-only. No AI generation, paid APIs or uploads.</small></p>"
+        "</html>"
+    )
