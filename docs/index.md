@@ -9,6 +9,7 @@ For questions, bugs or account help, see [Support](../SUPPORT.md).
 
 ## Architecture and implementation
 
+- [Offline Pixal3D high-poly QA](XINBA_PIXAL3D_QA.md)
 - [Local MCP tools, setup and security](MCP.md)
 - [Privacy and data handling](PRIVACY.md)
 - [Runtime map and integration status](architecture/runtime.md)
